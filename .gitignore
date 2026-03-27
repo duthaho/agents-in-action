@@ -1,0 +1,23 @@
+references/
+
+# Environment and secrets
+.env
+.env.*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# ChromaDB data
+chroma/
+
+# OS
+.DS_Store
+Thumbs.db
