@@ -23,6 +23,7 @@ import asyncio
 import uuid
 from pathlib import Path
 
+from checkpoint import SqliteCheckpointer
 from context import RunContext
 from cost import CostTracker
 from events import AsyncEventBus
@@ -49,7 +50,12 @@ async def run(args: argparse.Namespace) -> None:
     tracker = CostTracker()
     ctx.bus.subscribe(tracker.handle)
 
-    # Step 5 adds:  SqliteCheckpointer subscribed + ctx.checkpointer set
+    # Step 5: SqliteCheckpointer — persists ResearchState on each
+    # StateTransition. Attached to ctx so later steps can reach it.
+    checkpointer = SqliteCheckpointer(run_id=run_id, runs_dir=RUNS_DIR)
+    ctx.bus.subscribe(checkpointer.handle)
+    ctx.checkpointer = checkpointer
+
     # Step 6 adds:  AsyncApprovalGate attached to ctx.approval_gate
     # Step 7 adds:  ctx.stream = args.stream + TokenChunk stdout printer
 
@@ -58,7 +64,18 @@ async def run(args: argparse.Namespace) -> None:
     )
 
     try:
-        state = await orchestrator.run(ctx, args.query)
+        if args.resume:
+            state = checkpointer.latest()
+            if state is None:
+                raise SystemExit(
+                    f"No checkpoint found for run {args.resume}. "
+                    f"Check runs/{args.resume}/state.db exists."
+                )
+            print(f"  Resuming run {args.resume} from status='{state.status}' "
+                  f"(iteration {state.iteration})")
+            state = await orchestrator.resume(ctx, state)
+        else:
+            state = await orchestrator.run(ctx, args.query)
 
         print("\n" + "=" * 60)
         print(f"  FINAL REPORT  (run_id: {run_id})")
@@ -76,6 +93,7 @@ async def run(args: argparse.Namespace) -> None:
         print("-" * 60)
     finally:
         await logger.close()
+        checkpointer.close()
 
 
 def main() -> None:
