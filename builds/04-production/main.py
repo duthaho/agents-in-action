@@ -24,6 +24,7 @@ import uuid
 from pathlib import Path
 
 from context import RunContext
+from cost import CostTracker
 from events import AsyncEventBus
 from logger import JsonlLogger
 from orchestrator import GraphOrchestrator, SequentialPipeline
@@ -44,7 +45,10 @@ async def run(args: argparse.Namespace) -> None:
     logger = JsonlLogger(run_id=run_id, runs_dir=RUNS_DIR)
     ctx.bus.subscribe(logger.handle)
 
-    # Step 3 adds:  CostTracker subscribed to ctx.bus
+    # Step 3: CostTracker — aggregates CostRecorded events
+    tracker = CostTracker()
+    ctx.bus.subscribe(tracker.handle)
+
     # Step 5 adds:  SqliteCheckpointer subscribed + ctx.checkpointer set
     # Step 6 adds:  AsyncApprovalGate attached to ctx.approval_gate
     # Step 7 adds:  ctx.stream = args.stream + TokenChunk stdout printer
@@ -65,6 +69,10 @@ async def run(args: argparse.Namespace) -> None:
               f"{len(state.findings)} findings, "
               f"{len(state.report)} chars in report")
         print(f"  Event log: runs/{run_id}/events.jsonl")
+        print("-" * 60)
+        print("  COST")
+        print("-" * 60)
+        print(tracker.report())
         print("-" * 60)
     finally:
         await logger.close()

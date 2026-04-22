@@ -35,7 +35,23 @@ from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletionMessage
 
 from context import RunContext
-from events import LLMCallStarted, LLMCallCompleted, now
+from events import CostRecorded, LLMCallStarted, LLMCallCompleted, now
+
+# USD per 1,000 tokens. Hardcoded — a real system reads this from
+# config or a pricing API. Unknown models fall back to 0.0.
+MODEL_PRICES_USD_PER_1K: dict[str, dict[str, float]] = {
+    "gpt-4o-mini":   {"in": 0.00015, "out": 0.0006},
+    "gpt-4o":        {"in": 0.0025,  "out": 0.01},
+    "gpt-4.1-mini":  {"in": 0.0004,  "out": 0.0016},
+    "gpt-4.1":       {"in": 0.002,   "out": 0.008},
+}
+
+
+def _price_usd(model: str, prompt_tokens: int, completion_tokens: int) -> float:
+    p = MODEL_PRICES_USD_PER_1K.get(model)
+    if not p:
+        return 0.0
+    return (prompt_tokens / 1000) * p["in"] + (completion_tokens / 1000) * p["out"]
 
 _client: AsyncOpenAI | None = None
 
@@ -81,5 +97,18 @@ async def llm_call(
         run_id=ctx.run_id, timestamp=now(),
         agent=agent_name, model=model, usage=usage,
     ))
+
+    if usage:
+        await ctx.bus.publish(CostRecorded(
+            run_id=ctx.run_id, timestamp=now(),
+            agent=agent_name, model=model,
+            prompt_tokens=usage.get("prompt_tokens", 0),
+            completion_tokens=usage.get("completion_tokens", 0),
+            usd=_price_usd(
+                model,
+                usage.get("prompt_tokens", 0),
+                usage.get("completion_tokens", 0),
+            ),
+        ))
 
     return message
