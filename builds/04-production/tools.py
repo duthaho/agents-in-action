@@ -45,9 +45,25 @@ class Tool:
     sensitive: bool = False
 
     async def execute(self, ctx: Any, **kwargs) -> str:
-        # Sensitive-flag enforcement lands in Step 6. For now the flag
-        # is just stored. ApprovalDenied re-raise is pre-wired so the
-        # agent base can catch it symmetrically with ToolError.
+        # Sensitive tools require explicit human approval per call.
+        # Approval is per-call with actual arguments visible, not
+        # per-tool — three calls to the same tool require three
+        # separate approvals.
+        if self.sensitive:
+            gate = getattr(ctx, "approval_gate", None) if ctx else None
+            if gate is None:
+                raise ToolError(
+                    self.name,
+                    "sensitive tool requires an approval gate on ctx",
+                )
+            granted = await gate.request(
+                agent=getattr(ctx, "current_agent", "") or "unknown",
+                tool=self.name,
+                args=kwargs,
+            )
+            if not granted:
+                raise ApprovalDenied(f"user denied {self.name}")
+
         try:
             result = await self.func(**kwargs)
         except ApprovalDenied:
@@ -162,5 +178,15 @@ async def calculator(expression: str) -> str:
     return str(eval(expression, allowed))
 
 
-# Tools available to the researcher agent. Step 6 appends write_file.
-RESEARCH_TOOLS: list[Tool] = [web_search, calculator]
+@tool(sensitive=True)
+async def write_file(path: str, content: str) -> str:
+    """Write content to a file on disk. Creates parent directories. Requires human approval. Returns the number of bytes written."""
+    from pathlib import Path
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content, encoding="utf-8")
+    return f"wrote {len(content)} bytes to {path}"
+
+
+# Tools available to the researcher agent.
+RESEARCH_TOOLS: list[Tool] = [web_search, calculator, write_file]

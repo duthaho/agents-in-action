@@ -23,6 +23,7 @@ import asyncio
 import uuid
 from pathlib import Path
 
+from approval import AsyncApprovalGate
 from checkpoint import SqliteCheckpointer
 from context import RunContext
 from cost import CostTracker
@@ -56,7 +57,10 @@ async def run(args: argparse.Namespace) -> None:
     ctx.bus.subscribe(checkpointer.handle)
     ctx.checkpointer = checkpointer
 
-    # Step 6 adds:  AsyncApprovalGate attached to ctx.approval_gate
+    # Step 6: AsyncApprovalGate — blocks on CLI input for sensitive tools.
+    # Attached to ctx so Tool.execute can find it.
+    ctx.approval_gate = AsyncApprovalGate(ctx)
+
     # Step 7 adds:  ctx.stream = args.stream + TokenChunk stdout printer
 
     orchestrator = (
