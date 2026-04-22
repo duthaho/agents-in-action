@@ -28,14 +28,42 @@ running --help).
 """
 from __future__ import annotations
 
+import asyncio
 import os
+import random
 from typing import Any
 
-from openai import AsyncOpenAI
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    AsyncOpenAI,
+    InternalServerError,
+    RateLimitError,
+)
 from openai.types.chat import ChatCompletionMessage
 
 from context import RunContext
-from events import CostRecorded, LLMCallStarted, LLMCallCompleted, now
+from errors import MaxRetriesExceeded
+from events import (
+    CostRecorded,
+    LLMCallCompleted,
+    LLMCallFailed,
+    LLMCallStarted,
+    now,
+)
+
+# Retry policy for transient LLM errors. Permanent errors
+# (BadRequestError, AuthenticationError, etc.) propagate as-is —
+# retrying them is wasted money.
+MAX_ATTEMPTS = 4
+_RETRYABLE = (
+    APITimeoutError,
+    APIConnectionError,
+    RateLimitError,
+    InternalServerError,
+)
+_BACKOFF_BASE = 0.5       # seconds, doubled each retry
+_BACKOFF_JITTER = 0.25    # +U(0, JITTER) on each sleep
 
 # USD per 1,000 tokens. Hardcoded — a real system reads this from
 # config or a pricing API. Unknown models fall back to 0.0.
@@ -74,12 +102,19 @@ async def llm_call(
     agent_name: str = "",
     temperature: float = 0.7,
 ) -> ChatCompletionMessage:
-    model = model or DEFAULT_MODEL
+    """
+    Call the LLM with exponential-backoff retry on transient errors.
 
-    await ctx.bus.publish(LLMCallStarted(
-        run_id=ctx.run_id, timestamp=now(),
-        agent=agent_name, model=model,
-    ))
+    On each attempt we publish LLMCallStarted. On success we publish
+    LLMCallCompleted (+ CostRecorded if usage is available) and
+    return. On a retryable failure we publish LLMCallFailed with the
+    attempt number, sleep with jitter, and try again. After
+    MAX_ATTEMPTS we raise MaxRetriesExceeded.
+
+    Non-retryable errors (BadRequestError, AuthenticationError, ...)
+    propagate as-is — they're permanent.
+    """
+    model = model or DEFAULT_MODEL
 
     kwargs: dict[str, Any] = {
         "model": model,
@@ -89,26 +124,49 @@ async def llm_call(
     if tools:
         kwargs["tools"] = tools
 
-    response = await _get_client().chat.completions.create(**kwargs)
-    message = response.choices[0].message
-    usage = response.usage.model_dump() if response.usage else {}
+    delay = _BACKOFF_BASE
 
-    await ctx.bus.publish(LLMCallCompleted(
-        run_id=ctx.run_id, timestamp=now(),
-        agent=agent_name, model=model, usage=usage,
-    ))
-
-    if usage:
-        await ctx.bus.publish(CostRecorded(
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        await ctx.bus.publish(LLMCallStarted(
             run_id=ctx.run_id, timestamp=now(),
             agent=agent_name, model=model,
-            prompt_tokens=usage.get("prompt_tokens", 0),
-            completion_tokens=usage.get("completion_tokens", 0),
-            usd=_price_usd(
-                model,
-                usage.get("prompt_tokens", 0),
-                usage.get("completion_tokens", 0),
-            ),
         ))
 
-    return message
+        try:
+            response = await _get_client().chat.completions.create(**kwargs)
+            message = response.choices[0].message
+            usage = response.usage.model_dump() if response.usage else {}
+
+            await ctx.bus.publish(LLMCallCompleted(
+                run_id=ctx.run_id, timestamp=now(),
+                agent=agent_name, model=model, usage=usage,
+            ))
+
+            if usage:
+                await ctx.bus.publish(CostRecorded(
+                    run_id=ctx.run_id, timestamp=now(),
+                    agent=agent_name, model=model,
+                    prompt_tokens=usage.get("prompt_tokens", 0),
+                    completion_tokens=usage.get("completion_tokens", 0),
+                    usd=_price_usd(
+                        model,
+                        usage.get("prompt_tokens", 0),
+                        usage.get("completion_tokens", 0),
+                    ),
+                ))
+
+            return message
+
+        except _RETRYABLE as e:
+            await ctx.bus.publish(LLMCallFailed(
+                run_id=ctx.run_id, timestamp=now(),
+                agent=agent_name, model=model,
+                attempt=attempt, error=repr(e),
+            ))
+            if attempt == MAX_ATTEMPTS:
+                raise MaxRetriesExceeded(f"{type(e).__name__}: {e}") from e
+            await asyncio.sleep(delay + random.uniform(0, _BACKOFF_JITTER))
+            delay *= 2
+
+    # Unreachable — either we return from the try or raise from the except.
+    raise MaxRetriesExceeded("retry loop exited without return")
