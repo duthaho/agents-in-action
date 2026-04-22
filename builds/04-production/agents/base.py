@@ -35,13 +35,30 @@ ctx.stream is True. The rest of this loop stays the same.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from typing import Any
 
 from context import RunContext
 from errors import ApprovalDenied, ToolError
 from events import ToolCallCompleted, ToolCallFailed, ToolCallStarted, now
-from llm import llm_call
+from llm import llm_call, llm_stream
 from tools import Tool, get_tool_by_name
+
+
+# Lightweight holder for tool calls reassembled from a stream. The
+# non-streaming path returns OpenAI's native ToolCall objects with
+# the same .id / .function.name / .function.arguments surface — so
+# the rest of the ReAct loop can use them interchangeably.
+@dataclass
+class _StreamedFn:
+    name: str
+    arguments: str
+
+
+@dataclass
+class _StreamedToolCall:
+    id: str
+    function: _StreamedFn
 
 
 class BaseAgent:
@@ -70,21 +87,28 @@ class BaseAgent:
         ]
 
         for _ in range(self.max_iterations):
-            message = await llm_call(
-                ctx,
-                messages=messages,
-                tools=self.tool_schemas,
-                model=self.model,
-                agent_name=self.name,
-            )
-
-            tool_calls = message.tool_calls or []
+            # Streaming and non-streaming converge on the same shape:
+            # a content string + a list of tool-call objects exposing
+            # .id / .function.name / .function.arguments. The rest of
+            # the loop doesn't know or care which path produced them.
+            if ctx.stream:
+                content, tool_calls = await self._stream_once(ctx, messages)
+            else:
+                message = await llm_call(
+                    ctx,
+                    messages=messages,
+                    tools=self.tool_schemas,
+                    model=self.model,
+                    agent_name=self.name,
+                )
+                content = message.content
+                tool_calls = message.tool_calls or []
 
             if tool_calls:
                 # Record the assistant turn that issued the tool calls.
                 assistant_msg: dict[str, Any] = {"role": "assistant"}
-                if message.content:
-                    assistant_msg["content"] = message.content
+                if content:
+                    assistant_msg["content"] = content
                 assistant_msg["tool_calls"] = [
                     {
                         "id": tc.id,
@@ -112,9 +136,41 @@ class BaseAgent:
                 continue
 
             # No tool calls — plain text is the final answer.
-            return message.content or "(no response)"
+            return content or "(no response)"
 
         return "(max iterations reached)"
+
+    async def _stream_once(
+        self, ctx: RunContext, messages: list[dict]
+    ) -> tuple[str, list[_StreamedToolCall]]:
+        """
+        Drive llm_stream through one turn. Collects the final content
+        and reassembles tool-call fragments into objects shaped like
+        OpenAI's native ToolCall (same attribute surface) so the
+        ReAct loop works unchanged.
+        """
+        content = ""
+        tool_calls: list[_StreamedToolCall] = []
+        async for chunk in llm_stream(
+            ctx,
+            messages=messages,
+            tools=self.tool_schemas,
+            model=self.model,
+            agent_name=self.name,
+        ):
+            if chunk.kind == "final":
+                content = chunk.content
+                tool_calls = [
+                    _StreamedToolCall(
+                        id=tc["id"] or "",
+                        function=_StreamedFn(
+                            name=tc["function"]["name"],
+                            arguments=tc["function"]["arguments"],
+                        ),
+                    )
+                    for tc in (chunk.tool_calls or [])
+                ]
+        return content, tool_calls
 
     async def _invoke_tool(self, ctx: RunContext, name: str, raw_args: str) -> str:
         """

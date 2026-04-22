@@ -42,6 +42,9 @@ from openai import (
 )
 from openai.types.chat import ChatCompletionMessage
 
+from dataclasses import dataclass, field
+from typing import AsyncIterator
+
 from context import RunContext
 from errors import MaxRetriesExceeded
 from events import (
@@ -49,6 +52,7 @@ from events import (
     LLMCallCompleted,
     LLMCallFailed,
     LLMCallStarted,
+    TokenChunk,
     now,
 )
 
@@ -170,3 +174,143 @@ async def llm_call(
 
     # Unreachable — either we return from the try or raise from the except.
     raise MaxRetriesExceeded("retry loop exited without return")
+
+
+# ─── Streaming (Step 7) ────────────────────────────────────────────
+
+@dataclass
+class StreamChunk:
+    """What `llm_stream` yields to its caller.
+
+    kind="text"   → a text delta arrived. `text` holds the delta.
+    kind="final"  → the stream has ended. `content` holds the full
+                    concatenated text; `tool_calls` holds the
+                    reassembled tool-call list.
+    """
+    kind: str
+    text: str = ""
+    content: str = ""
+    tool_calls: list = field(default_factory=list)
+
+
+def _merge_tool_call_deltas(acc: dict[int, dict], deltas) -> None:
+    """
+    OpenAI streams tool calls in fragments. Each delta carries an
+    index (which tool call it belongs to), optionally an id, and
+    optionally name + argument fragments that must be concatenated.
+
+    We keep an accumulator keyed by index and merge fragments in
+    place. After the stream closes, acc.values() is the completed
+    tool-call list.
+    """
+    for d in deltas or []:
+        idx = d.index
+        slot = acc.setdefault(idx, {
+            "id": None,
+            "type": "function",
+            "function": {"name": "", "arguments": ""},
+        })
+        if getattr(d, "id", None):
+            slot["id"] = d.id
+        fn = getattr(d, "function", None)
+        if fn is not None:
+            if getattr(fn, "name", None):
+                slot["function"]["name"] = fn.name
+            if getattr(fn, "arguments", None):
+                slot["function"]["arguments"] += fn.arguments
+
+
+async def llm_stream(
+    ctx: RunContext,
+    *,
+    messages: list[dict],
+    tools: list[dict] | None = None,
+    model: str | None = None,
+    agent_name: str = "",
+    temperature: float = 0.7,
+) -> AsyncIterator[StreamChunk]:
+    """
+    Streaming LLM call. Yields StreamChunk(kind="text") for each
+    content delta, then a single StreamChunk(kind="final") when the
+    stream closes.
+
+    No retries. Retry-after-partial-stream is a rabbit hole (would
+    require replaying deltas). If the connection drops, we surface
+    the error; the caller can fall back to llm_call for that step.
+
+    Tool calls execute AFTER the stream closes — fragment-by-fragment
+    execution on half-parsed args is unsafe.
+
+    `stream_options={"include_usage": True}` tells OpenAI to send a
+    final chunk carrying the usage totals, so the cost event still
+    fires with real numbers.
+    """
+    model = model or DEFAULT_MODEL
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    if tools:
+        kwargs["tools"] = tools
+
+    await ctx.bus.publish(LLMCallStarted(
+        run_id=ctx.run_id, timestamp=now(),
+        agent=agent_name, model=model,
+    ))
+
+    stream = await _get_client().chat.completions.create(**kwargs)
+    text_parts: list[str] = []
+    tool_accumulator: dict[int, dict] = {}
+    usage_dict: dict = {}
+
+    async for chunk in stream:
+        # The terminal usage chunk has no choices — it's sent at the
+        # very end when stream_options.include_usage is True.
+        if getattr(chunk, "usage", None):
+            usage_dict = (
+                chunk.usage.model_dump()
+                if hasattr(chunk.usage, "model_dump")
+                else dict(chunk.usage)
+            )
+            continue
+        if not chunk.choices:
+            continue
+
+        delta = chunk.choices[0].delta
+
+        if getattr(delta, "content", None):
+            text_parts.append(delta.content)
+            await ctx.bus.publish(TokenChunk(
+                run_id=ctx.run_id, timestamp=now(),
+                agent=agent_name, text=delta.content,
+            ))
+            yield StreamChunk(kind="text", text=delta.content)
+
+        if getattr(delta, "tool_calls", None):
+            _merge_tool_call_deltas(tool_accumulator, delta.tool_calls)
+
+    await ctx.bus.publish(LLMCallCompleted(
+        run_id=ctx.run_id, timestamp=now(),
+        agent=agent_name, model=model, usage=usage_dict,
+    ))
+    if usage_dict:
+        await ctx.bus.publish(CostRecorded(
+            run_id=ctx.run_id, timestamp=now(),
+            agent=agent_name, model=model,
+            prompt_tokens=usage_dict.get("prompt_tokens", 0),
+            completion_tokens=usage_dict.get("completion_tokens", 0),
+            usd=_price_usd(
+                model,
+                usage_dict.get("prompt_tokens", 0),
+                usage_dict.get("completion_tokens", 0),
+            ),
+        ))
+
+    yield StreamChunk(
+        kind="final",
+        content="".join(text_parts),
+        tool_calls=list(tool_accumulator.values()),
+    )

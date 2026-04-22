@@ -23,11 +23,13 @@ import asyncio
 import uuid
 from pathlib import Path
 
+import sys
+
 from approval import AsyncApprovalGate
 from checkpoint import SqliteCheckpointer
 from context import RunContext
 from cost import CostTracker
-from events import AsyncEventBus
+from events import AsyncEventBus, TokenChunk
 from logger import JsonlLogger
 from orchestrator import GraphOrchestrator, SequentialPipeline
 
@@ -61,7 +63,17 @@ async def run(args: argparse.Namespace) -> None:
     # Attached to ctx so Tool.execute can find it.
     ctx.approval_gate = AsyncApprovalGate(ctx)
 
-    # Step 7 adds:  ctx.stream = args.stream + TokenChunk stdout printer
+    # Step 7: streaming — flip ctx.stream and subscribe a printer that
+    # writes every TokenChunk.text to stdout as it arrives.
+    if args.stream:
+        ctx.stream = True
+
+        async def _print_tokens(event):
+            if isinstance(event, TokenChunk):
+                sys.stdout.write(event.text)
+                sys.stdout.flush()
+
+        ctx.bus.subscribe(_print_tokens)
 
     orchestrator = (
         GraphOrchestrator() if args.pattern == "graph" else SequentialPipeline()
